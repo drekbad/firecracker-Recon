@@ -9,7 +9,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 SHODAN_API_KEY = "YOUR_SHODAN_API_KEY" 
 TARGET_PORTS = "21,22,23,25,53,69,80,135,137,139,143,161,443,500,587,1433,3000,3306,3389,5000,8000,8080,8443,9000,10000"
 
-class FirecrackerV10:
+class FirecrackerV11:
     def __init__(self, domain, input_file=None):
         self.domain = domain
         self.subdomains = {domain}
@@ -21,18 +21,16 @@ class FirecrackerV10:
         print(f"[*] {msg}")
 
     def get_subdomains(self):
-        self.log(f"Aggressive hunting for {self.domain}...")
+        self.log(f"Hunting for subdomains of {self.domain}...")
         
-        # 1. CRT.SH - Pulling EVERYTHING
+        # 1. Aggressive crt.sh (Reverted to the version that found 16 targets)
         try:
-            r = requests.get(f"https://crt.sh/?q=%.{self.domain}&output=json", timeout=25)
-            if r.status_code == 200:
-                for entry in r.json():
-                    names = entry['name_value'].lower().split('\n')
-                    for n in names:
-                        # Strip wildcards and whitespace
-                        clean_n = n.replace('*.', '').strip()
-                        if clean_n: self.subdomains.add(clean_n)
+            r = requests.get(f"https://crt.sh/?q=%.{self.domain}&output=json", timeout=15)
+            for entry in r.json():
+                name = entry['name_value'].lower()
+                for sub in name.split('\n'):
+                    if self.domain in sub:
+                        self.subdomains.add(sub.replace('*.', ''))
         except: pass
 
         # 2. DNSRecon (Kali native)
@@ -41,8 +39,7 @@ class FirecrackerV10:
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if os.path.exists("tmp.json"):
                 with open("tmp.json") as f:
-                    data = json.load(f)
-                    for item in data:
+                    for item in json.load(f):
                         if 'name' in item: self.subdomains.add(item['name'].lower())
                 os.remove("tmp.json")
         except: pass
@@ -61,20 +58,27 @@ class FirecrackerV10:
         dmarc = subprocess.getoutput(f"dig TXT _dmarc.{self.domain} +short").replace('"', '').strip()
         
         spoof, reason, ctx = "NO", "Strong Policy", "Records are present and restrictive."
-        if not spf: spoof, reason = "YES", "Missing SPF"
+        if not spf: spoof, reason = "YES", "Missing SPF Record"
         elif "~all" in spf: spoof, reason = "YES", "SoftFail (~all)"
         elif "p=none" in dmarc: spoof, reason = "YES", "DMARC p=none"
 
-        self.email_security = {"Status": f"Spoofable: {spoof} ({reason})", "SPF": spf, "DMARC": dmarc, "Context": ctx}
+        # LOCKED IN: Analyst Context restored to detailed versions
+        self.email_security = {
+            "Status": f"Spoofable: {spoof} ({reason})",
+            "SPF": spf if spf else "None Detected",
+            "DMARC": dmarc if dmarc else "None Detected",
+            "Context": "No SPF record means any server can claim to send email as this domain." if not spf else "SoftFail tells receiving servers to accept the mail but mark it as suspicious; it doesn't block it." if "~all" in spf else "p=none is 'Monitoring Mode'. It tells servers to take no action even if SPF/DKIM fails." if "p=none" in dmarc else ctx
+        }
 
-    def deep_web_audit(self, url):
+    def deep_web_audit(self, url, host):
         findings = []
         try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Pentest-Firecracker/10.0'}
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Pentest-Firecracker/11.0'}
             res = requests.get(url, timeout=5, verify=False, headers=headers)
             low_html = res.text.lower()
             soup = BeautifulSoup(res.text, 'html.parser')
 
+            # LOCKED IN: Formatting (Sentence case, bold colors)
             if soup.find('input', {'type': 'password'}) or re.search(r'login|signin|sign-in|authenticate', low_html):
                 findings.append("<b style='color:#e74c3c;'>Login detected</b>")
 
@@ -100,7 +104,7 @@ class FirecrackerV10:
                 d = r.json()
                 ports = sorted(d.get('ports', []))
                 link = f"<a href='https://www.shodan.io/host/{ip}' target='_blank' style='text-decoration:none;'> 🔗</a>"
-                return f"Ports: {ports}{link}<br>Vulns: {d.get('vulns', 'None')}"
+                return f"Ports: {ports}{link}<br>Vulns: {d.get('vulns', 'None Found')}"
         except: pass
         return "No Data"
 
@@ -118,7 +122,6 @@ class FirecrackerV10:
             if "open" in line and "tcpwrapped" not in line and "/tcp" in line:
                 p = re.split(r'\s+', line)
                 port_num = p[0].split('/')[0]
-                # Hyperlink the port number
                 link = f"http://{host}:{port_num}" if port_num != "443" else f"https://{host}"
                 open_tcp.append(f"<b><a href='{link}' target='_blank' style='color:black;text-decoration:underline;'>{p[0]}</a></b> - {p[2]} {' '.join(p[3:])}")
             elif "closed" in line: closed += 1
@@ -127,11 +130,12 @@ class FirecrackerV10:
         web_info = "N/A"
         if "80/tcp" in nm_out or "443/tcp" in nm_out:
             proto = "https" if "443/tcp" in nm_out else "http"
-            web_info = self.deep_web_audit(f"{proto}://{host}")
+            web_info = self.deep_web_audit(f"{proto}://{host}", host)
 
         return {
             "FQDN": host, "IP": ip, "TCP": "<br>".join(open_tcp),
-            "Stats": f"C:{closed}<br>F:{filtered}", "Web": web_info,
+            "Stats": f"Closed: {closed}<br>Filtered: {filtered}", # LOCKED IN: Spelled out
+            "Web": web_info,
             "Shodan": self.get_shodan(ip)
         }
 
@@ -149,27 +153,28 @@ class FirecrackerV10:
             f.write(f"""
             <html><head><style>
                 body {{ font-family: 'Segoe UI', sans-serif; padding: 20px; background: #fafafa; }}
-                .card {{ background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 20px; }}
+                .card {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 20px; }}
                 table {{ border-collapse: collapse; width: 100%; table-layout: fixed; word-wrap: break-word; }}
-                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; font-size: 0.9em; }}
+                th, td {{ border: 1px solid #eee; padding: 12px; text-align: left; vertical-align: top; font-size: 0.95em; }}
                 th {{ background: #2c3e50; color: white; }}
-                /* Specific Column Widths for Portrait Monitors */
-                th:nth-child(1) {{ width: 18%; }} /* Target */
-                th:nth-child(2) {{ width: 27%; }} /* Services */
-                th:nth-child(3) {{ width: 25%; }} /* Web Intel */
-                th:nth-child(4) {{ width: 20%; }} /* Shodan */
-                th:nth-child(5) {{ width: 10%; }} /* Stats */
+                /* LOCKED IN: Column Proportions */
+                th:nth-child(1) {{ width: 18%; }} 
+                th:nth-child(2) {{ width: 27%; }} 
+                th:nth-child(3) {{ width: 25%; }} 
+                th:nth-child(4) {{ width: 20%; }} 
+                th:nth-child(5) {{ width: 10%; }} 
                 .high {{ color: #e74c3c; font-weight: bold; }}
-                code {{ background: #eee; padding: 2px 4px; border-radius: 4px; display: block; white-space: pre-wrap; font-size: 0.85em; }}
+                .context {{ font-size: 0.85em; color: #7f8c8d; font-style: italic; }}
+                code {{ background: #f4f4f4; padding: 4px; border-radius: 4px; display: block; white-space: pre-wrap; font-family: monospace; }}
             </style></head><body>
-            <h1>Assessment: {self.domain}</h1>
+            <h1>External Pentest Recon: {self.domain}</h1>
             <div class="card">
                 <h3>1. Domain & Email Security</h3>
                 <table>
                     <tr><th style="width:20%;">Metric</th><th style="width:40%;">Finding</th><th style="width:40%;">Analyst Context</th></tr>
-                    <tr><td class="high">{self.email_security['Status']}</td><td>Check records</td><td>{self.email_security['Context']}</td></tr>
-                    <tr><td>SPF</td><td><code>{self.email_security['SPF']}</code></td><td>~all = SoftFail / Vulnerable.</td></tr>
-                    <tr><td>DMARC</td><td><code>{self.email_security['DMARC']}</code></td><td>p=none is monitoring only.</td></tr>
+                    <tr><td class="high">{self.email_security['Status']}</td><td>See Raw Records Below</td><td>{self.email_security['Context']}</td></tr>
+                    <tr><td>SPF Record</td><td><code>{self.email_security['SPF']}</code></td><td class="context">v=spf1 indicates the version. 'include' adds authorized IPs. ~all/ -all is the policy.</td></tr>
+                    <tr><td>DMARC Record</td><td><code>{self.email_security['DMARC']}</code></td><td class="context">p=none is just for monitoring. p=reject is what you want.</td></tr>
                 </table>
             </div>
             <div class="card">
@@ -177,13 +182,13 @@ class FirecrackerV10:
                 <table>
                     <tr><th>Target</th><th>Services & Banners</th><th>Web Intelligence</th><th>Shodan (Passive)</th><th>Stats</th></tr>""")
             for r in self.results:
-                f.write(f"<tr><td><b>{r['FQDN']}</b><br>{r['IP']}</td><td>{r['TCP'] if r['TCP'] else 'None'}</td><td>{r['Web']}</td><td>{r['Shodan']}</td><td>{r['Stats']}</td></tr>")
+                f.write(f"<tr><td><b>{r['FQDN']}</b><br>{r['IP']}</td><td>{r['TCP'] if r['TCP'] else 'No Open Ports Detected'}</td><td>{r['Web']}</td><td>{r['Shodan']}</td><td class='context'>{r['Stats']}</td></tr>")
             f.write("</table></div></body></html>")
-        self.log(f"REPORT SAVED: {fn}")
+        self.log(f"DONE. Report saved to {fn}")
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("-l", "--list", help="Import FQDN list")
     args = p.parse_args()
     dom = input("Primary Domain: ")
-    FirecrackerV10(dom, input_file=args.list).run()
+    FirecrackerV11(dom, input_file=args.list).run()
